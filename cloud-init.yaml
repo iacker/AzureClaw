@@ -1,0 +1,468 @@
+#cloud-config
+# terraform-azurerm-openclaw — cloud-init bootstrap
+# Installs Docker + OpenClaw on Ubuntu 24.04 LTS
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+  - unzip
+  - ufw
+  - fail2ban
+
+write_files:
+  # UFW setup
+  - path: /tmp/setup-firewall.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -eu
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow 22/tcp comment 'SSH'
+      ufw allow 80/tcp comment 'Traefik HTTP'
+      ufw allow 443/tcp comment 'Traefik HTTPS'
+      ufw --force enable
+
+  # fail2ban — SSH brute-force protection
+  - path: /etc/fail2ban/jail.d/sshd.conf
+    content: |
+      [sshd]
+      enabled  = true
+      maxretry = 5
+      bantime  = 3600
+      findtime = 600
+
+  # OpenClaw first-boot setup service
+  - path: /etc/systemd/system/openclaw-setup.service
+    content: |
+      [Unit]
+      Description=OpenClaw first-boot setup
+      After=docker.service network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/home/${admin_username}/.openclaw-setup-done
+
+      [Service]
+      Type=oneshot
+      User=${admin_username}
+      WorkingDirectory=/home/${admin_username}/openclaw
+      EnvironmentFile=/home/${admin_username}/openclaw/.env
+      ExecStart=/home/${admin_username}/openclaw/first-boot.sh
+      StandardOutput=append:/var/log/openclaw-setup.log
+      StandardError=append:/var/log/openclaw-setup.log
+      TimeoutStartSec=1800
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # First-boot script — written to /tmp to avoid write_files running before
+  # the admin user is created by the Azure Linux Agent (cloud-init ordering
+  # issue: write_files runs before users_groups on Azure Ubuntu 24.04).
+  # The runcmd stage moves this file to ~/openclaw/ after user creation.
+  - path: /tmp/openclaw-first-boot.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -eu
+      LOG=/var/log/openclaw-setup.log
+      DONE_MARKER=/home/${admin_username}/.openclaw-setup-done
+
+      log() { echo "$(date -Iseconds) $*" | tee -a "$LOG"; }
+
+      log "=== OpenClaw first-boot setup starting ==="
+
+      # ── Key Vault secret fetch (via IMDS — no azure-cli required) ────
+%{ if use_key_vault_secrets ~}
+      log "Fetching API key from Key Vault: ${key_vault_name}"
+      TOKEN=""
+      for i in $(seq 1 10); do
+        TOKEN=$(curl -sf \
+          -H "Metadata: true" \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net" \
+          | jq -r '.access_token // empty' 2>/dev/null) && [ -n "$TOKEN" ] && break
+        log "IMDS attempt $i/10 failed, retrying in $((i * 10))s..."
+        sleep $((i * 10))
+      done
+
+      if [ -n "$TOKEN" ]; then
+%{ if llm_provider == "anthropic" ~}
+        SECRET=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+          "https://${key_vault_name}.vault.azure.net/secrets/anthropic-api-key?api-version=7.4" \
+          | jq -r '.value // empty')
+        [ -n "$SECRET" ] && echo "ANTHROPIC_API_KEY=$SECRET" >> /home/${admin_username}/openclaw/.env \
+          && log "anthropic-api-key injected from Key Vault"
+%{ endif ~}
+%{ if llm_provider == "azure-openai" ~}
+        SECRET=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+          "https://${key_vault_name}.vault.azure.net/secrets/azure-openai-api-key?api-version=7.4" \
+          | jq -r '.value // empty')
+        [ -n "$SECRET" ] && echo "AZURE_OPENAI_API_KEY=$SECRET" >> /home/${admin_username}/openclaw/.env \
+          && log "azure-openai-api-key injected from Key Vault"
+%{ endif ~}
+%{ if enable_teams ~}
+        SECRET=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+          "https://${key_vault_name}.vault.azure.net/secrets/ms-app-password?api-version=7.4" \
+          | jq -r '.value // empty')
+        [ -n "$SECRET" ] && echo "MICROSOFT_APP_PASSWORD=$SECRET" >> /home/${admin_username}/openclaw/.env \
+          && log "ms-app-password injected from Key Vault"
+%{ endif ~}
+        chmod 600 /home/${admin_username}/openclaw/.env
+      else
+        log "WARNING: could not obtain IMDS token — API key not injected"
+      fi
+%{ endif ~}
+
+      # ── Re-source .env with secrets ──────────────────────────────────
+      set -o allexport
+      source /home/${admin_username}/openclaw/.env
+      set +o allexport
+
+      # ── Pull pre-built image (ghcr.io) ───────────────────────────────
+      log "Pulling OpenClaw image: $OPENCLAW_IMAGE"
+      docker pull "$OPENCLAW_IMAGE"
+
+      # ── Seed config directories ───────────────────────────────────────
+      mkdir -p "$OPENCLAW_CONFIG_DIR/identity"
+      mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/agent"
+      mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/sessions"
+
+      # Fix permissions so container's node user (uid 1000) can write
+      docker run --rm --user root --entrypoint sh "$OPENCLAW_IMAGE" -c \
+        "echo uid=\$(id -u node) gid=\$(id -g node)" 2>/dev/null | grep -oE '[0-9]+' | head -1 \
+        | xargs -I{} find "$OPENCLAW_CONFIG_DIR" -exec chown {}:{} {} \; 2>/dev/null || true
+
+      # ── Generate gateway token ────────────────────────────────────────
+      OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)
+      echo "OPENCLAW_GATEWAY_TOKEN=$OPENCLAW_GATEWAY_TOKEN" >> /home/${admin_username}/openclaw/.env
+
+      # ── Configure gateway non-interactively ──────────────────────────
+      log "Configuring OpenClaw gateway..."
+      docker compose run --rm openclaw-cli config set gateway.mode local
+      docker compose run --rm openclaw-cli config set gateway.bind lan
+      docker compose run --rm openclaw-cli config set \
+        gateway.controlUi.allowedOrigins '["http://127.0.0.1:18789"]' --strict-json
+      docker compose run --rm openclaw-cli config set agents.defaults.sandbox.mode off
+%{ if enable_teams ~}
+
+      # ── Teams plugin (msteams) ─────────────────────────────────────
+      log "Configuring msteams plugin..."
+      docker compose run --rm openclaw-cli config set plugins.allow '["msteams"]' --strict-json
+%{ if ms_app_id != "" ~}
+      docker compose run --rm openclaw-cli config set channels.msteams.appId "${ms_app_id}"
+%{ endif ~}
+%{ endif ~}
+
+      # ── Start all services ───────────────────────────────────────────
+      log "Starting OpenClaw + Traefik..."
+      docker compose up -d
+
+      # ── Done ─────────────────────────────────────────────────────────
+      touch "$DONE_MARKER"
+      log "=== OpenClaw setup complete ==="
+      log "Gateway token: $OPENCLAW_GATEWAY_TOKEN"
+      log "Access via SSH tunnel: ssh -L 8443:127.0.0.1:443 ${admin_username}@<IP>"
+      log "Then open: https://openclaw.local:8443"
+
+runcmd:
+  # ── Docker ────────────────────────────────────────────────────────────
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - chmod a+r /etc/apt/keyrings/docker.gpg
+  - |
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+  - apt-get update -qq
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - usermod -aG docker ${admin_username}
+  - systemctl enable docker
+
+  # ── Firewall ──────────────────────────────────────────────────────────
+  - /tmp/setup-firewall.sh
+
+  # ── fail2ban ──────────────────────────────────────────────────────────
+  - systemctl enable fail2ban
+  - systemctl start fail2ban
+
+  # ── SSH Hardening ─────────────────────────────────────────────────────
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
+  - systemctl restart ssh
+
+  # ── OpenClaw directories & .env ───────────────────────────────────────
+  - mkdir -p /home/${admin_username}/.openclaw/workspace
+  - mkdir -p /home/${admin_username}/openclaw/traefik
+  - |
+    cat > /home/${admin_username}/openclaw/.env << 'ENVEOF'
+    OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:latest
+    OPENCLAW_CONFIG_DIR=/home/${admin_username}/.openclaw
+    OPENCLAW_WORKSPACE_DIR=/home/${admin_username}/.openclaw/workspace
+    OPENCLAW_GATEWAY_BIND=lan
+    OPENCLAW_GATEWAY_PORT=18789
+    OPENCLAW_BRIDGE_PORT=18790
+%{ if llm_provider == "azure-openai" ~}
+    ANTHROPIC_API_KEY=openclaw-litellm
+    ANTHROPIC_BASE_URL=http://litellm:4000
+    OPENAI_API_KEY=openclaw-litellm
+    OPENAI_BASE_URL=http://litellm:4000
+    AZURE_OPENAI_ENDPOINT=${azure_openai_endpoint}
+%{ endif ~}
+%{ if !use_key_vault_secrets ~}
+%{ if llm_provider == "anthropic" && anthropic_api_key != "" ~}
+    ANTHROPIC_API_KEY=${anthropic_api_key}
+%{ endif ~}
+%{ if llm_provider == "azure-openai" && azure_openai_api_key != "" ~}
+    AZURE_OPENAI_API_KEY=${azure_openai_api_key}
+%{ endif ~}
+%{ endif ~}
+%{ if enable_teams && ms_app_id != "" ~}
+    MICROSOFT_APP_ID=${ms_app_id}
+%{ endif ~}
+    ENVEOF
+  - chmod 600 /home/${admin_username}/openclaw/.env
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}/.openclaw
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}/openclaw
+
+  # ── Clone openclaw repo (for docker-compose.yml + traefik config) ─────
+  - |
+    su - ${admin_username} -c '
+%{ if openclaw_version != "latest" ~}
+      git clone --branch ${openclaw_version} --depth 1 https://github.com/openclaw/openclaw.git /home/${admin_username}/openclaw/repo
+%{ else ~}
+      git clone --depth 1 https://github.com/openclaw/openclaw.git /home/${admin_username}/openclaw/repo
+%{ endif ~}
+      cp /home/${admin_username}/openclaw/repo/docker-compose.yml /home/${admin_username}/openclaw/docker-compose.yml
+    '
+
+  # ── docker-compose.yml ────────────────────────────────────────────────
+  - |
+    cat > /home/${admin_username}/openclaw/docker-compose.yml << 'COMPOSEEOF'
+    services:
+
+      traefik:
+        image: traefik:v3.3
+        restart: unless-stopped
+        ports:
+          - "80:80"
+          - "443:443"
+          - "127.0.0.1:8080:8080"
+        volumes:
+          - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+          - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+%{ if enable_letsencrypt ~}
+          - ./letsencrypt:/letsencrypt
+%{ endif ~}
+        command:
+          - "--configfile=/etc/traefik/traefik.yml"
+
+      openclaw-gateway:
+        image: $${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+        environment:
+          HOME: /home/node
+          TERM: xterm-256color
+          OPENCLAW_GATEWAY_TOKEN: $${OPENCLAW_GATEWAY_TOKEN:-}
+          ANTHROPIC_API_KEY: $${ANTHROPIC_API_KEY:-}
+          ANTHROPIC_BASE_URL: $${ANTHROPIC_BASE_URL:-}
+          OPENAI_API_KEY: $${OPENAI_API_KEY:-}
+          OPENAI_BASE_URL: $${OPENAI_BASE_URL:-}
+          OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: $${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS:-}
+          TZ: $${OPENCLAW_TZ:-UTC}
+%{ if enable_teams ~}
+          MICROSOFT_APP_ID: $${MICROSOFT_APP_ID:-}
+          MICROSOFT_APP_PASSWORD: $${MICROSOFT_APP_PASSWORD:-}
+%{ endif ~}
+        volumes:
+          - $${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+          - $${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+        ports:
+          - "127.0.0.1:$${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+          - "127.0.0.1:$${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+        init: true
+        restart: unless-stopped
+        read_only: true
+        tmpfs:
+          - /tmp
+        cap_drop: [ALL]
+        security_opt: [no-new-privileges:true]
+        command: ["node", "dist/index.js", "gateway", "--bind", "$${OPENCLAW_GATEWAY_BIND:-lan}", "--port", "18789"]
+        healthcheck:
+          test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+          interval: 30s
+          timeout: 5s
+          retries: 5
+          start_period: 20s
+
+      openclaw-cli:
+        image: $${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+        network_mode: "service:openclaw-gateway"
+        cap_drop: [NET_RAW, NET_ADMIN]
+        security_opt: [no-new-privileges:true]
+        environment:
+          HOME: /home/node
+          TERM: xterm-256color
+          OPENCLAW_GATEWAY_TOKEN: $${OPENCLAW_GATEWAY_TOKEN:-}
+          BROWSER: echo
+          TZ: $${OPENCLAW_TZ:-UTC}
+        volumes:
+          - $${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+          - $${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+        stdin_open: true
+        tty: true
+        init: true
+        entrypoint: ["node", "dist/index.js"]
+        depends_on: [openclaw-gateway]
+%{ if llm_provider == "azure-openai" ~}
+
+      litellm:
+        image: ghcr.io/berriai/litellm:main-latest
+        restart: unless-stopped
+        ports:
+          - "127.0.0.1:4000:4000"
+        volumes:
+          - ./litellm-config.yaml:/app/config.yaml:ro
+        environment:
+          AZURE_OPENAI_API_KEY: $${AZURE_OPENAI_API_KEY:-}
+        cap_drop: [ALL]
+        security_opt: [no-new-privileges:true]
+        command: ["--config", "/app/config.yaml", "--port", "4000"]
+%{ endif ~}
+    COMPOSEEOF
+
+  - |
+    cat > /home/${admin_username}/openclaw/traefik/traefik.yml << 'TRAEFIKEOF'
+    api:
+      dashboard: true
+      insecure: true
+    entryPoints:
+      web:
+        address: ":80"
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+      websecure:
+        address: ":443"
+    providers:
+      file:
+        filename: /etc/traefik/dynamic.yml
+        watch: true
+    log:
+      level: INFO
+%{ if enable_letsencrypt ~}
+    certificatesResolvers:
+      letsencrypt:
+        acme:
+          email: ${acme_email_effective}
+          storage: /letsencrypt/acme.json
+          httpChallenge:
+            entryPoint: web
+%{ endif ~}
+    TRAEFIKEOF
+
+  - |
+    cat > /home/${admin_username}/openclaw/traefik/dynamic.yml << 'DYNAMICEOF'
+    http:
+      routers:
+        openclaw:
+          rule: "Host(`openclaw.local`)"
+          entryPoints: [websecure]
+          service: openclaw-gateway
+          tls: {}
+%{ if enable_public_https && public_domain != "" ~}
+        openclaw-public:
+          rule: "Host(`${public_domain}`)"
+          entryPoints: [websecure]
+          service: openclaw-gateway
+%{ if enable_letsencrypt ~}
+          tls:
+            certResolver: letsencrypt
+            domains:
+              - main: ${public_domain}
+%{ else ~}
+          tls: {}
+%{ endif ~}
+%{ endif ~}
+%{ if enable_teams && teams_bot_domain != "" ~}
+        openclaw-teams:
+          rule: "Host(`${teams_bot_domain}`) && PathPrefix(`/api/messages`)"
+          entryPoints: [websecure]
+          service: openclaw-gateway
+%{ if teams_acme_email != "" ~}
+          tls:
+            certResolver: letsencrypt
+            domains:
+              - main: ${teams_bot_domain}
+%{ else ~}
+          tls: {}
+%{ endif ~}
+%{ endif ~}
+        traefik-dashboard:
+          rule: "Host(`traefik.openclaw.local`)"
+          entryPoints: [websecure]
+          service: api@internal
+          tls: {}
+      services:
+        openclaw-gateway:
+          loadBalancer:
+            servers:
+              - url: "http://openclaw-gateway:18789"
+            passHostHeader: true
+    tls:
+      options:
+        default:
+          minVersion: VersionTLS12
+    DYNAMICEOF
+
+%{ if llm_provider == "azure-openai" ~}
+  # ── LiteLLM config (Azure OpenAI proxy) ───────────────────────────────
+  - |
+    cat > /home/${admin_username}/openclaw/litellm-config.yaml << 'LITELLMEOF'
+    model_list:
+      - model_name: claude-opus-4-6
+        litellm_params:
+          model: azure/${azure_openai_deployment}
+          api_base: ${azure_openai_endpoint}
+          api_key: os.environ/AZURE_OPENAI_API_KEY
+          api_version: "2024-12-01-preview"
+    litellm_settings:
+      drop_params: true
+    general_settings:
+      master_key: openclaw-litellm
+    LITELLMEOF
+
+%{ endif ~}
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}/openclaw
+
+%{ if enable_letsencrypt ~}
+  # ── Let's Encrypt storage (Traefik ACME) ──────────────────────────────
+  - mkdir -p /home/${admin_username}/openclaw/letsencrypt
+  - touch /home/${admin_username}/openclaw/letsencrypt/acme.json
+  - chmod 600 /home/${admin_username}/openclaw/letsencrypt/acme.json
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}/openclaw/letsencrypt
+
+%{ endif ~}
+  # Move first-boot script from /tmp (where write_files wrote it) to its
+  # final location now that the user and directories exist.
+  - install -o ${admin_username} -g ${admin_username} -m 0755 /tmp/openclaw-first-boot.sh /home/${admin_username}/openclaw/first-boot.sh
+
+  # ── Enable & start first-boot service ─────────────────────────────────
+  - systemctl enable openclaw-setup.service
+  - systemctl start openclaw-setup.service
+
+%{ if enable_tailscale && tailscale_auth_key != "" ~}
+  # ── Tailscale ─────────────────────────────────────────────────────────
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - tailscale up --authkey="${tailscale_auth_key}" --hostname="${project_name}-azure" --ssh
+%{ endif ~}
+
+  # ── Done marker ───────────────────────────────────────────────────────
+  - echo "$(date -Iseconds) cloud-init complete" >> /var/log/openclaw-setup.log
+
+final_message: "OpenClaw cloud-init complete. First-boot setup running in background (journalctl -u openclaw-setup -f)"

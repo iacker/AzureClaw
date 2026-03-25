@@ -1,0 +1,47 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "{{UNIQUE_APP_ID}}",
+  "packageName": "com.openclaw.teams",
+  "developer": {
+    "name": "OpenClaw",
+    "websiteUrl": "https://openclaw.ai",
+    "privacyUrl": "https://openclaw.ai/privacy",
+    "termsOfUseUrl": "https://openclaw.ai/terms"
+  },
+  "name": {
+    "short": "OpenClaw",
+    "full": "OpenClaw AI Agent"
+  },
+  "description": {
+    "short": "AI coding agent powered by Claude",
+    "full": "OpenClaw brings an AI coding agent to your Teams workspace, powered by Anthropic Claude or Azure OpenAI. Chat with the agent directly in Teams to get coding help, code reviews, and more."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#0078d4",
+  "bots": [
+    {
+      "botId": "{{MS_APP_ID}}",
+      "scopes": ["personal", "team", "groupChat"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            {
+              "title": "help",
+              "description": "Show available commands"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["{{TEAMS_BOT_DOMAIN}}"]
+}

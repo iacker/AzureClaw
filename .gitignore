@@ -1,0 +1,41 @@
+# Terraform state — never commit
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+
+# Terraform working directory
+.terraform/
+
+# Lock file — COMMIT THIS for reproducible provider versions
+# .terraform.lock.hcl
+
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Secrets — NEVER commit
+terraform.tfvars
+*.auto.tfvars
+.env
+.env.production
+secrets/
+
+# SSH keys
+*.pem
+id_rsa*
+id_ed25519*
+
+# Backups
+backups/
+
+# macOS
+.DS_Store
+
+# JetBrains / VSCode
+.idea/
+.vscode/
+
+# Claude Code
+.claude/

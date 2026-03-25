@@ -1,0 +1,27 @@
+http:
+  routers:
+    openclaw:
+      rule: "Host(`openclaw.local`)"
+      entryPoints:
+        - websecure
+      service: openclaw-gateway
+      tls: {}
+
+    traefik-dashboard:
+      rule: "Host(`traefik.openclaw.local`)"
+      entryPoints:
+        - websecure
+      service: api@internal
+      tls: {}
+
+  services:
+    openclaw-gateway:
+      loadBalancer:
+        servers:
+          - url: "http://openclaw-gateway:18789"
+        passHostHeader: true
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12

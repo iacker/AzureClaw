@@ -1,0 +1,75 @@
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+# ── Authentication ────────────────────────────────────────────────────────
+# RECOMMENDED: use the environment variable instead of hardcoding here
+#   export ARM_SUBSCRIPTION_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# subscription_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# ── Azure ─────────────────────────────────────────────────────────────────
+location            = "westeurope" # westeurope = Netherlands (closest to Paris)
+resource_group_name = "rg-openclaw"
+
+# ── VM sizing ─────────────────────────────────────────────────────────────
+# Standard_B2s  = 2 vCPU /  4 GB — ~37€/month (absolute minimum)
+# Standard_B2ms = 2 vCPU /  8 GB — ~67€/month (recommended)
+# Standard_B4ms = 4 vCPU / 16 GB — ~134€/month (for Ollama local models)
+vm_size         = "Standard_B2ms"
+os_disk_size_gb = 30
+
+# ── SSH ───────────────────────────────────────────────────────────────────
+# REQUIRED: restrict to your public IP before deploying
+admin_username    = "openclaw"
+ssh_public_key    = "" # leave empty to auto-generate; run `make save-key` after apply
+ssh_allowed_cidrs = ["YOUR_PUBLIC_IP/32"]
+
+# ── Gateway ───────────────────────────────────────────────────────────────
+expose_gateway = false # true = open port 18789 publicly (not recommended)
+
+# ── Key Vault ─────────────────────────────────────────────────────────────
+enable_key_vault = true # stores API keys; VM fetches them at boot via managed identity
+
+# ── LLM Provider ─────────────────────────────────────────────────────────
+# "anthropic"    → set anthropic_api_key
+# "azure-openai" → set azure_openai_endpoint + azure_openai_api_key
+# "openai"       → set OPENAI_API_KEY manually on the VM after deploy
+llm_provider      = "anthropic"
+anthropic_api_key = "" # sk-ant-...
+
+# azure_openai_endpoint    = "https://YOUR_RESOURCE.openai.azure.com/openai/v1"
+# azure_openai_api_key     = ""
+# azure_openai_deployment  = "my-gpt4-deployment" # deployment name in Azure OpenAI studio
+
+# ── OpenClaw version ──────────────────────────────────────────────────────
+# Pin to a release tag for reproducible deployments (e.g. "v1.2.0")
+openclaw_version = "latest"
+
+# ── Public HTTPS (optional) ───────────────────────────────────────────
+# Enable to expose OpenClaw at a real domain with Let's Encrypt TLS.
+# Prerequisites: DNS A record pointing your domain to the VM public IP.
+# enable_public_https = true
+# public_domain       = "openclaw.example.com"
+# acme_email          = "you@example.com"  # for Let's Encrypt notifications
+
+# ── Tailscale (optional) ──────────────────────────────────────────────────
+# Zero-trust access — replaces public SSH exposure when fully set up
+enable_tailscale   = false
+tailscale_auth_key = "" # tskey-auth-...
+
+# ── Microsoft Teams (optional) ────────────────────────────────────────────
+# Prerequisites:
+#   1. Create an App Registration in portal.azure.com → App registrations
+#      → copy the Application (client) ID → ms_app_id
+#      → create a client secret → ms_app_password (or use TF_VAR_ms_app_password)
+#   2. Point a domain at the VM IP → teams_bot_domain
+#   3. After deploy: run `make teams-manifest` to generate the Teams app package
+enable_teams     = false
+ms_app_id        = "" # Application (client) ID from Azure AD App Registration
+ms_app_password  = "" # prefer: export TF_VAR_ms_app_password="..."
+teams_bot_domain = "" # e.g. openclaw.example.com
+teams_acme_email = "" # email for Let's Encrypt certificate (required for valid TLS)
+
+# ── Tags ──────────────────────────────────────────────────────────────────
+project_name = "openclaw"
+environment  = "prod" # dev | staging | prod
