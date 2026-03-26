@@ -160,7 +160,7 @@ write_files:
            --arg url "$AZURE_BASE_URL" \
            --arg dep "$AZURE_DEPLOYMENT" \
            '.models = {"providers": {"azure-openai-responses": {
-              "baseUrl": $url, "apiKey": $key, "api": "openai-responses",
+              "baseUrl": $url, "apiKey": $key, "api": "openai-completions",
               "authHeader": false, "headers": {"api-key": $key},
               "models": [{"id": $dep, "name": ($dep + " (Azure OpenAI)"),
                 "reasoning": false, "input": ["text", "image"],
