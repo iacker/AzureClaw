@@ -147,6 +147,34 @@ write_files:
       docker compose run --rm openclaw-cli config set \
         gateway.controlUi.allowedOrigins '["http://127.0.0.1:18789"]' --strict-json
       docker compose run --rm openclaw-cli config set agents.defaults.sandbox.mode off
+%{ if llm_provider == "azure-openai" ~}
+
+      # ── Configure Azure OpenAI direct connection ──────────────────────
+      log "Configuring Azure OpenAI direct connection..."
+      AZURE_API_KEY=$(grep 'AZURE_OPENAI_API_KEY' /home/${admin_username}/openclaw/.env | cut -d= -f2- || true)
+      AZURE_BASE_URL=$(echo "${azure_openai_endpoint}" | sed 's|/openai/v1/*$||; s|/*$||')/openai/v1
+      AZURE_DEPLOYMENT="${azure_openai_deployment}"
+      OC_JSON="$OPENCLAW_CONFIG_DIR/openclaw.json"
+      if [ -f "$OC_JSON" ] && [ -n "$AZURE_API_KEY" ] && [ -n "$AZURE_DEPLOYMENT" ]; then
+        jq --arg key "$AZURE_API_KEY" \
+           --arg url "$AZURE_BASE_URL" \
+           --arg dep "$AZURE_DEPLOYMENT" \
+           '.models = {"providers": {"azure-openai-responses": {
+              "baseUrl": $url, "apiKey": $key, "api": "openai-responses",
+              "authHeader": false, "headers": {"api-key": $key},
+              "models": [{"id": $dep, "name": ($dep + " (Azure OpenAI)"),
+                "reasoning": false, "input": ["text", "image"],
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "contextWindow": 128000, "maxTokens": 16384,
+                "compat": {"supportsStore": false}}]}}} |
+           .agents.defaults.model = ("azure-openai-responses/" + $dep)' \
+           "$OC_JSON" > /tmp/oc-cfg.json && mv /tmp/oc-cfg.json "$OC_JSON"
+        chown $(stat -c '%u:%g' "$OC_JSON") "$OC_JSON" 2>/dev/null || true
+        log "Azure OpenAI provider configured in openclaw.json (model: azure-openai-responses/$AZURE_DEPLOYMENT)"
+      else
+        log "WARNING: could not configure Azure OpenAI provider (key or deployment missing)"
+      fi
+%{ endif ~}
 %{ if enable_teams ~}
 
       # ── Teams plugin (msteams) ─────────────────────────────────────
@@ -206,13 +234,6 @@ runcmd:
     OPENCLAW_GATEWAY_BIND=lan
     OPENCLAW_GATEWAY_PORT=18789
     OPENCLAW_BRIDGE_PORT=18790
-%{ if llm_provider == "azure-openai" ~}
-    ANTHROPIC_API_KEY=openclaw-litellm
-    ANTHROPIC_BASE_URL=http://litellm:4000
-    OPENAI_API_KEY=openclaw-litellm
-    OPENAI_BASE_URL=http://litellm:4000
-    AZURE_OPENAI_ENDPOINT=${azure_openai_endpoint}
-%{ endif ~}
 %{ if !use_key_vault_secrets ~}
 %{ if llm_provider == "anthropic" && anthropic_api_key != "" ~}
     ANTHROPIC_API_KEY=${anthropic_api_key}
@@ -267,10 +288,6 @@ runcmd:
           HOME: /home/node
           TERM: xterm-256color
           OPENCLAW_GATEWAY_TOKEN: $${OPENCLAW_GATEWAY_TOKEN:-}
-          ANTHROPIC_API_KEY: $${ANTHROPIC_API_KEY:-}
-          ANTHROPIC_BASE_URL: $${ANTHROPIC_BASE_URL:-}
-          OPENAI_API_KEY: $${OPENAI_API_KEY:-}
-          OPENAI_BASE_URL: $${OPENAI_BASE_URL:-}
           OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: $${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS:-}
           TZ: $${OPENCLAW_TZ:-UTC}
 %{ if enable_teams ~}
@@ -317,21 +334,6 @@ runcmd:
         init: true
         entrypoint: ["node", "dist/index.js"]
         depends_on: [openclaw-gateway]
-%{ if llm_provider == "azure-openai" ~}
-
-      litellm:
-        image: ghcr.io/berriai/litellm:main-latest
-        restart: unless-stopped
-        ports:
-          - "127.0.0.1:4000:4000"
-        volumes:
-          - ./litellm-config.yaml:/app/config.yaml:ro
-        environment:
-          AZURE_OPENAI_API_KEY: $${AZURE_OPENAI_API_KEY:-}
-        cap_drop: [ALL]
-        security_opt: [no-new-privileges:true]
-        command: ["--config", "/app/config.yaml", "--port", "4000"]
-%{ endif ~}
     COMPOSEEOF
 
   - |
@@ -420,24 +422,6 @@ runcmd:
           minVersion: VersionTLS12
     DYNAMICEOF
 
-%{ if llm_provider == "azure-openai" ~}
-  # ── LiteLLM config (Azure OpenAI proxy) ───────────────────────────────
-  - |
-    cat > /home/${admin_username}/openclaw/litellm-config.yaml << 'LITELLMEOF'
-    model_list:
-      - model_name: claude-opus-4-6
-        litellm_params:
-          model: azure/${azure_openai_deployment}
-          api_base: ${azure_openai_endpoint}
-          api_key: os.environ/AZURE_OPENAI_API_KEY
-          api_version: "2024-12-01-preview"
-    litellm_settings:
-      drop_params: true
-    general_settings:
-      master_key: openclaw-litellm
-    LITELLMEOF
-
-%{ endif ~}
   - chown -R ${admin_username}:${admin_username} /home/${admin_username}/openclaw
 
 %{ if enable_letsencrypt ~}
