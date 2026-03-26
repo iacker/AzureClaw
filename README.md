@@ -50,22 +50,21 @@ This module automates the full Azure deployment: VM, networking, secrets, Docker
 │  │  Docker stack                                         │ │
 │  │  ├── Traefik v3   :80/:443 public, :8080 loopback     │ │
 │  │  │   └── Let's Encrypt TLS (when enable_public_https) │ │
-│  │  ├── OpenClaw Gateway  :18789 loopback only           │ │
-│  │  │   └── Token auth + allowedOrigins enforced         │ │
-│  │  └── LiteLLM  :4000 loopback only (azure-openai mode) │ │
-│  │      └── Proxy Anthropic API → Azure OpenAI           │ │
+│  │  └── OpenClaw Gateway  :18789 loopback only           │ │
+│  │      └── Token auth + allowedOrigins enforced         │ │
 │  └───────────────────────────────────────────────────────┘ │
 │                                                             │
 │  ┌── Key Vault ──────────────────────────────────────────┐ │
 │  │  anthropic-api-key / azure-openai-api-key (secret)    │ │
-│  │  RBAC: Deployer → Secrets Officer (write, CI only)    │ │
+│  │  RBAC: Deployer → Secrets Officer (write)             │ │
 │  │  RBAC: VM identity → Secrets User (read-only)         │ │
 │  │  Soft-delete 30d + purge protection                   │ │
 │  └───────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
                           │
-                          ▼ HTTPS (azure-openai mode)
-              Azure OpenAI (YOUR_RESOURCE.openai.azure.com)
+                          ▼ HTTPS
+              Anthropic API  or  Azure OpenAI
+              (YOUR_RESOURCE.openai.azure.com/openai/v1)
 ```
 
 ---
@@ -95,7 +94,6 @@ This module automates the full Azure deployment: VM, networking, secrets, Docker
 | Runtime | Docker CE + Compose | Container runtime |
 | Proxy | Traefik v3.3 | Reverse proxy, TLS, Let's Encrypt |
 | App | OpenClaw Gateway | AI agent gateway |
-| Proxy | LiteLLM *(azure-openai only)* | Translates Anthropic API → Azure OpenAI |
 
 ### Security posture — Docker ports
 
@@ -106,7 +104,6 @@ All internal ports are bound to `127.0.0.1` (loopback), not `0.0.0.0`. Docker by
 | 80 | `0.0.0.0` | Internet (HTTP → HTTPS redirect) |
 | 443 | `0.0.0.0` | Internet (TLS) |
 | 18789 | `127.0.0.1` | SSH tunnel only |
-| 4000 | `127.0.0.1` | VM internal (LiteLLM) |
 | 8080 | `127.0.0.1` | SSH tunnel only (Traefik dashboard) |
 
 ---
@@ -160,22 +157,21 @@ anthropic_api_key = ""   # pass via TF_VAR_anthropic_api_key
 
 The API key is stored in Key Vault and fetched at boot via managed identity.
 
-### Azure OpenAI (via LiteLLM proxy)
+### Azure OpenAI (direct)
 
-OpenClaw natively speaks the Anthropic API. When using Azure OpenAI, LiteLLM is automatically deployed as a proxy that translates Anthropic API calls to the Azure OpenAI format.
+OpenClaw connects directly to Azure OpenAI using the OpenAI Chat Completions API. No proxy required.
 
 ```hcl
 llm_provider             = "azure-openai"
 azure_openai_endpoint    = "https://YOUR_RESOURCE.openai.azure.com/openai/v1"
 azure_openai_api_key     = ""              # pass via TF_VAR_azure_openai_api_key
-azure_openai_deployment  = "my-gpt4-deployment"   # your deployment name
+azure_openai_deployment  = "my-deployment-name"
 ```
 
 What gets configured automatically:
-- LiteLLM container added to the Docker stack (port 4000, loopback only)
-- `ANTHROPIC_BASE_URL=http://litellm:4000` injected in `.env`
-- `litellm-config.yaml` generated with your deployment and endpoint
-- Azure OpenAI API key stored in Key Vault, fetched at boot
+- `models.providers.azure-openai-responses` written into `openclaw.json` at first boot
+- API key stored in Key Vault, fetched at boot via managed identity, injected into the config
+- OpenClaw calls `YOUR_RESOURCE.openai.azure.com/openai/v1` directly with `api-key` header auth
 
 ### OpenAI
 
@@ -257,7 +253,7 @@ With `enable_key_vault = true` (default):
 1. Terraform writes the API key to Key Vault (Secrets Officer role)
 2. The raw key is **never written to disk on the VM during provisioning**
 3. At boot, the VM fetches it via IMDS + managed identity (Secrets User, read-only)
-4. The key is appended to `~/openclaw/.env` (chmod 600) and passed to containers
+4. The key is injected into `openclaw.json` (for azure-openai) or `~/openclaw/.env` (for anthropic)
 
 ```bash
 make kv-set NAME=azure-openai-api-key VALUE=...   # Update a Key Vault secret
@@ -355,7 +351,6 @@ make openclaw-log        # OpenClaw first-boot log
 | Network | Port binding | Internal ports on `127.0.0.1` — Docker/UFW bypass mitigated |
 | VM | SSH hardening | Key-only, no root, MaxAuthTries 3 |
 | VM | fail2ban | 5 retries → 1h ban, SSH jail |
-| VM | unattended-upgrades | Security patches applied automatically |
 | Containers | cap_drop: ALL | All Linux capabilities dropped |
 | Containers | no-new-privileges | Privilege escalation blocked |
 | Containers | read_only | Gateway filesystem read-only + tmpfs /tmp |
@@ -382,20 +377,9 @@ make pair-approve ID=<request-id>
 Add your domain to the allowed origins on the VM:
 
 ```bash
-TOKEN=$(ssh -i ~/.ssh/openclaw.pem openclaw@<IP> \
-  'grep OPENCLAW_GATEWAY_TOKEN ~/openclaw/.env | cut -d= -f2')
 ssh -i ~/.ssh/openclaw.pem openclaw@<IP> "cd ~/openclaw && \
   docker compose run --rm openclaw-cli config set \
   gateway.controlUi.allowedOrigins '[\"https://YOUR_DOMAIN\"]' --strict-json"
-```
-
-**LiteLLM container unhealthy (azure-openai mode)**
-
-Check that `AZURE_OPENAI_API_KEY` was fetched correctly:
-
-```bash
-make openclaw-log    # should show "azure-openai-api-key injected from Key Vault"
-make logs            # check LiteLLM startup errors
 ```
 
 **Gateway not accessible after `make tunnel`**
@@ -403,6 +387,16 @@ make logs            # check LiteLLM startup errors
 1. Verify the tunnel is active (keep the terminal open)
 2. `make status` — check container health
 3. `make logs` — check gateway errors
+
+**Azure OpenAI not responding (azure-openai mode)**
+
+Check that the API key and provider config were written correctly at first boot:
+
+```bash
+make openclaw-log    # should show "Azure OpenAI provider configured in openclaw.json"
+ssh -i ~/.ssh/openclaw.pem openclaw@<IP> \
+  "cat ~/.openclaw/openclaw.json | python3 -m json.tool | grep -A3 azure"
+```
 
 **Key Vault `prevent_destroy` blocks `terraform destroy`**
 
@@ -425,7 +419,7 @@ By design. To remove:
 ├── locals.tf          # Tags, cloud-init template rendering, computed locals
 ├── variables.tf       # All input variables with validations
 ├── outputs.tf         # SSH command, tunnel command, gateway URL
-├── cloud-init.yaml    # VM bootstrap: Docker, security, OpenClaw + LiteLLM
+├── cloud-init.yaml    # VM bootstrap: Docker, security, OpenClaw setup
 ├── docker-compose.yml # Local dev compose reference
 ├── traefik/           # Traefik static and dynamic config (local dev)
 ├── ARCHITECTURE.md    # Detailed architecture + security documentation
