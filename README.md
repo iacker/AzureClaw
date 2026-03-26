@@ -2,8 +2,6 @@
   <img src="docs/logo.png" alt="OpenClaw on Azure" width="400" />
 </div>
 
-# AzureClaw
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Terraform](https://img.shields.io/badge/Terraform-1.5+-purple.svg)](https://www.terraform.io/)
 [![Azure](https://img.shields.io/badge/Azure-azurerm_4.x-blue.svg)](https://registry.terraform.io/providers/hashicorp/azurerm/latest)
