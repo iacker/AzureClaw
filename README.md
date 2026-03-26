@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/logo.png" alt="OpenClaw on Azure" width="200" />
+  <img src="docs/logo.png" alt="OpenClaw on Azure" width="400" />
 </div>
 
 # terraform-azurerm-openclaw
@@ -14,11 +14,18 @@ Inspired by [openclaw-terraform-hetzner](https://github.com/andreesg/openclaw-te
 
 ---
 
-## What is OpenClaw?
+## Why Azure?
 
-OpenClaw is an AI coding agent (by Peter Steinberger) that runs a persistent gateway on a remote server. You connect to it from any machine via a browser — no local install needed.
+Hosting OpenClaw on Azure unlocks integrations that aren't possible on a generic VPS:
 
-This module automates the full Azure deployment: VM, networking, secrets, Docker stack, and security hardening — all in one `make apply`.
+- **Microsoft Teams bot** — expose OpenClaw as a Teams channel; your colleagues interact with the AI agent directly from Teams without any extra tool
+- **Azure OpenAI** — use GPT-4o or GPT-4.1 models billed to your existing Azure subscription, without going through Anthropic or OpenAI directly
+- **Office 365 identity** — authenticate users via Azure AD (Entra ID), so access is tied to your org's SSO and conditional access policies
+- **Private networking** — deploy into an existing VNet and keep all traffic inside your Azure tenant, away from the public internet
+- **Compliance & sovereignty** — data stays in your Azure region; useful for orgs with data residency requirements (GDPR, HDS, etc.)
+- **Managed secrets** — API keys live in Azure Key Vault, fetched at boot via Managed Identity — no credentials in config files or CI pipelines
+
+This module automates the full deployment: VM, networking, Key Vault, Docker stack, and security hardening — all in one `make apply`.
 
 ---
 
